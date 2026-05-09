@@ -1441,6 +1441,72 @@ def make_loaders(
     return train_loader, val_loader, test_loader
 
 
+TABULAR_MODELS = {"ridge", "random_forest", "xgboost"}
+
+
+def anchors_to_tabular(
+    x_scaled: np.ndarray,
+    y_scaled: np.ndarray,
+    anchors: np.ndarray,
+    horizon_steps: int,
+    cfg: Config,
+) -> Tuple[np.ndarray, np.ndarray]:
+    x_rows = []
+    y_rows = []
+    for anchor in anchors:
+        start = int(anchor) - cfg.lookback_steps + 1
+        target = int(anchor) + horizon_steps
+        x_rows.append(x_scaled[start : int(anchor) + 1].reshape(-1))
+        y_rows.append(y_scaled[target])
+    return np.vstack(x_rows).astype(np.float32), np.vstack(y_rows).astype(np.float32)
+
+
+def build_tabular_regressor(name: str, seed: int):
+    key = name.lower()
+    if key == "ridge":
+        from sklearn.linear_model import Ridge
+
+        return Ridge(alpha=5.0, random_state=seed)
+    if key == "random_forest":
+        from sklearn.ensemble import RandomForestRegressor
+
+        return RandomForestRegressor(
+            n_estimators=120,
+            max_depth=18,
+            min_samples_leaf=3,
+            max_features="sqrt",
+            n_jobs=2,
+            random_state=seed,
+        )
+    if key == "xgboost":
+        from sklearn.multioutput import MultiOutputRegressor
+        from xgboost import XGBRegressor
+
+        estimator = XGBRegressor(
+            n_estimators=240,
+            max_depth=4,
+            learning_rate=0.04,
+            subsample=0.85,
+            colsample_bytree=0.85,
+            objective="reg:squarederror",
+            random_state=seed,
+            n_jobs=2,
+            tree_method="hist",
+        )
+        return MultiOutputRegressor(estimator, n_jobs=1)
+    raise ValueError(f"Unknown tabular model: {name}")
+
+
+def predict_tabular_in_chunks(model, x: np.ndarray, chunk_size: int = 50000) -> np.ndarray:
+    parts = []
+    for start in range(0, len(x), chunk_size):
+        pred = np.asarray(model.predict(x[start : start + chunk_size]), dtype=np.float32)
+        if pred.ndim == 1:
+            pred = pred.reshape(-1, 1)
+        parts.append(pred)
+    return np.vstack(parts)
+
+
 def prepare_feature_mode(
     mode: str,
     x_raw: np.ndarray,
@@ -1569,6 +1635,17 @@ def train_direct(
     train_targets = train_anchors + horizon_steps
     y_scaler = ArrayScaler().fit(y_temp[train_targets])
     y_scaled = y_scaler.transform(y_temp)
+    if model_name.lower() in TABULAR_MODELS:
+        x_train, y_train = anchors_to_tabular(x_scaled, y_scaled, train_anchors, horizon_steps, cfg)
+        x_val, y_val = anchors_to_tabular(x_scaled, y_scaled, val_anchors, horizon_steps, cfg)
+        x_test, _ = anchors_to_tabular(x_scaled, y_scaled, test_anchors, horizon_steps, cfg)
+        model = build_tabular_regressor(model_name, cfg.seeds[0] if cfg.seeds else 42)
+        model.fit(x_train, y_train)
+        val_pred = predict_tabular_in_chunks(model, x_val)
+        best_val = float(np.mean((val_pred - y_val) ** 2))
+        pred_scaled = predict_tabular_in_chunks(model, x_test)
+        return y_scaler.inverse_transform(pred_scaled), best_val
+
     loaders = make_loaders(
         x_scaled, y_scaled, train_anchors, val_anchors, test_anchors, horizon_steps, cfg
     )
@@ -1608,6 +1685,29 @@ def train_factorized(
 
     mean_model_name, resid_spec = split_factorized_model_name(model_name)
     resid_decomp, resid_model_name = split_residual_model_spec(resid_spec)
+    if mean_model_name.lower() in TABULAR_MODELS or resid_model_name.lower() in TABULAR_MODELS:
+        if mean_model_name.lower() != resid_model_name.lower() or resid_decomp != "direct":
+            raise ValueError("Tabular factorized baselines must use the same direct model name")
+        resid_scaler_tab = ArrayScaler().fit(resid_raw[train_targets])
+        resid_scaled_tab = resid_scaler_tab.transform(resid_raw)
+        x_train, y_mean_train = anchors_to_tabular(x_scaled, mean_scaled, train_anchors, horizon_steps, cfg)
+        x_val, y_mean_val = anchors_to_tabular(x_scaled, mean_scaled, val_anchors, horizon_steps, cfg)
+        x_test, _ = anchors_to_tabular(x_scaled, mean_scaled, test_anchors, horizon_steps, cfg)
+        _, y_resid_train = anchors_to_tabular(x_scaled, resid_scaled_tab, train_anchors, horizon_steps, cfg)
+        _, y_resid_val = anchors_to_tabular(x_scaled, resid_scaled_tab, val_anchors, horizon_steps, cfg)
+        seed = cfg.seeds[0] if cfg.seeds else 42
+        mean_model = build_tabular_regressor(model_name, seed)
+        resid_model = build_tabular_regressor(model_name, seed + 17)
+        mean_model.fit(x_train, y_mean_train.ravel())
+        resid_model.fit(x_train, y_resid_train)
+        val_mean = predict_tabular_in_chunks(mean_model, x_val)
+        val_resid = predict_tabular_in_chunks(resid_model, x_val)
+        best_val = float(0.5 * np.mean((val_mean - y_mean_val) ** 2) + 0.5 * np.mean((val_resid - y_resid_val) ** 2))
+        pred_mean = mean_scaler.inverse_transform(predict_tabular_in_chunks(mean_model, x_test))
+        pred_resid = resid_scaler_tab.inverse_transform(predict_tabular_in_chunks(resid_model, x_test))
+        pred_resid = pred_resid - np.mean(pred_resid, axis=1, keepdims=True)
+        return pred_mean + pred_resid, best_val
+
     mean_model = build_model(mean_model_name, cfg.lookback_steps, x_scaled.shape[1], 1, cfg)
 
     pca_model = None
@@ -1880,7 +1980,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=(
             "Comma-separated: mlp,dlinear,lstm_attn,mscnn_lstm_attn,transformer,"
             "patch_transformer,itransformer,autoformer_lite,crossformer_lite,"
-            "pathformer_lite,timexer_lite,timecard_sensor_lite,softs_sensor_lite. "
+            "pathformer_lite,timexer_lite,timecard_sensor_lite,softs_sensor_lite,"
+            "ridge,random_forest,xgboost. "
             "For factorized runs, mean__residual combines two model names; "
             "prefix residual with pca_ to predict low-rank spatial residual coefficients."
         ),

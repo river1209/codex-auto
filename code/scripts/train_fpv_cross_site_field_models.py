@@ -225,6 +225,17 @@ def load_cross_site_dataframe(site: str, temp_cols: Sequence[str], cfg: CrossSit
 
     for col in temp_cols:
         out[col] = df[col]
+    if cfg.target_outlier_threshold > 0:
+        y_clean, removed = base.remove_field_outlier_rows(
+            out[list(temp_cols)].to_numpy(dtype=np.float32),
+            cfg.target_outlier_threshold,
+        )
+        out.loc[:, list(temp_cols)] = y_clean
+        if removed:
+            print(
+                f"{site}: removed {removed} target outlier rows "
+                f"(threshold={cfg.target_outlier_threshold:g} degC)"
+            )
     return out
 
 
@@ -299,6 +310,14 @@ def make_loader(
     )
 
 
+def make_scaler(kind: str):
+    if kind.lower() == "robust":
+        return base.RobustArrayScaler()
+    if kind.lower() == "standard":
+        return base.ArrayScaler()
+    raise ValueError(f"Unknown scaler: {kind}")
+
+
 def fit_global_scalers(
     sites: Sequence[SiteArrays],
     train_refs: Sequence[Tuple[int, int]],
@@ -310,9 +329,124 @@ def fit_global_scalers(
     for site_idx, anchor in train_refs:
         x_rows.append(sites[site_idx].x_raw[anchor])
         y_rows.append(y_target_by_site[site_idx][anchor + cfg.horizon_steps])
-    x_scaler = base.ArrayScaler().fit(np.vstack(x_rows).astype(np.float32))
-    y_scaler = base.ArrayScaler().fit(np.vstack(y_rows).astype(np.float32))
+    x_scaler = make_scaler(cfg.scaler).fit(np.vstack(x_rows).astype(np.float32))
+    y_scaler = make_scaler(cfg.scaler).fit(np.vstack(y_rows).astype(np.float32))
     return x_scaler, y_scaler
+
+
+TABULAR_MODELS = {"ridge", "random_forest", "xgboost"}
+
+
+def refs_to_tabular(
+    x_scaled_by_site: Sequence[np.ndarray],
+    y_scaled_by_site: Sequence[np.ndarray],
+    refs: Sequence[Tuple[int, int]],
+    cfg: CrossSiteConfig,
+) -> Tuple[np.ndarray, np.ndarray]:
+    x_rows = []
+    y_rows = []
+    for site_idx, anchor in refs:
+        start = anchor - cfg.lookback_steps + 1
+        target = anchor + cfg.horizon_steps
+        x_rows.append(x_scaled_by_site[site_idx][start : anchor + 1].reshape(-1))
+        y_rows.append(y_scaled_by_site[site_idx][target])
+    return np.vstack(x_rows).astype(np.float32), np.vstack(y_rows).astype(np.float32)
+
+
+def build_tabular_regressor(name: str, seed: int):
+    key = name.lower()
+    if key == "ridge":
+        from sklearn.linear_model import Ridge
+
+        return Ridge(alpha=5.0, random_state=seed)
+    if key == "random_forest":
+        from sklearn.ensemble import RandomForestRegressor
+
+        return RandomForestRegressor(
+            n_estimators=120,
+            max_depth=18,
+            min_samples_leaf=3,
+            max_features="sqrt",
+            n_jobs=2,
+            random_state=seed,
+        )
+    if key == "xgboost":
+        from sklearn.multioutput import MultiOutputRegressor
+        from xgboost import XGBRegressor
+
+        estimator = XGBRegressor(
+            n_estimators=240,
+            max_depth=4,
+            learning_rate=0.04,
+            subsample=0.85,
+            colsample_bytree=0.85,
+            objective="reg:squarederror",
+            random_state=seed,
+            n_jobs=2,
+            tree_method="hist",
+        )
+        return MultiOutputRegressor(estimator, n_jobs=1)
+    raise ValueError(f"Unknown tabular model: {name}")
+
+
+def predict_tabular_in_chunks(model, x: np.ndarray, chunk_size: int = 50000) -> np.ndarray:
+    parts = []
+    for start in range(0, len(x), chunk_size):
+        parts.append(np.asarray(model.predict(x[start : start + chunk_size]), dtype=np.float32))
+    pred = np.vstack(parts)
+    if pred.ndim == 1:
+        pred = pred.reshape(-1, 1)
+    return pred
+
+
+def train_factorized_cross_site_tabular(
+    model_name: str,
+    sites: Sequence[SiteArrays],
+    train_refs: Sequence[Tuple[int, int]],
+    val_refs: Sequence[Tuple[int, int]],
+    test_refs: Sequence[Tuple[int, int]],
+    cfg: CrossSiteConfig,
+    seed: int,
+) -> Tuple[np.ndarray, np.ndarray, List[pd.Timestamp], float]:
+    mean_raw_by_site = [np.mean(site.y_raw, axis=1, keepdims=True) for site in sites]
+    resid_raw_by_site = [site.y_raw - mean_raw for site, mean_raw in zip(sites, mean_raw_by_site)]
+
+    x_scaler, mean_scaler = fit_global_scalers(sites, train_refs, mean_raw_by_site, cfg)
+    _, resid_scaler = fit_global_scalers(sites, train_refs, resid_raw_by_site, cfg)
+    x_scaled = [x_scaler.transform(site.x_raw) for site in sites]
+    mean_scaled = [mean_scaler.transform(mean_raw) for mean_raw in mean_raw_by_site]
+    resid_scaled = [resid_scaler.transform(resid_raw) for resid_raw in resid_raw_by_site]
+
+    x_train, y_mean_train = refs_to_tabular(x_scaled, mean_scaled, train_refs, cfg)
+    _, y_resid_train = refs_to_tabular(x_scaled, resid_scaled, train_refs, cfg)
+    x_val, y_mean_val = refs_to_tabular(x_scaled, mean_scaled, val_refs, cfg)
+    _, y_resid_val = refs_to_tabular(x_scaled, resid_scaled, val_refs, cfg)
+    x_test, _ = refs_to_tabular(x_scaled, mean_scaled, test_refs, cfg)
+
+    mean_model = build_tabular_regressor(model_name, seed)
+    resid_model = build_tabular_regressor(model_name, seed + 17)
+    mean_model.fit(x_train, y_mean_train.ravel())
+    resid_model.fit(x_train, y_resid_train)
+
+    val_mean = predict_tabular_in_chunks(mean_model, x_val)
+    val_resid = predict_tabular_in_chunks(resid_model, x_val)
+    best_val = float(
+        0.5 * np.mean((val_mean - y_mean_val) ** 2)
+        + 0.5 * np.mean((val_resid - y_resid_val) ** 2)
+    )
+
+    pred_mean = mean_scaler.inverse_transform(predict_tabular_in_chunks(mean_model, x_test))
+    pred_resid = resid_scaler.inverse_transform(predict_tabular_in_chunks(resid_model, x_test))
+    pred_resid = pred_resid - np.mean(pred_resid, axis=1, keepdims=True)
+    y_pred = pred_mean + pred_resid
+
+    y_true = []
+    target_times: List[pd.Timestamp] = []
+    for site_idx, anchor in test_refs:
+        target = anchor + cfg.horizon_steps
+        y_true.append(sites[site_idx].y_raw[target])
+        target_times.append(sites[site_idx].df.index[target])
+    return np.vstack(y_true).astype(np.float32), y_pred.astype(np.float32), target_times, best_val
 
 
 def train_factorized_cross_site(
@@ -349,6 +483,7 @@ def train_factorized_cross_site(
         dropout=cfg.dropout,
         loss=cfg.loss,
         spatial_loss_weight=cfg.spatial_loss_weight,
+        finite_prediction_clip=cfg.finite_prediction_clip,
         epoch_pause_sec=cfg.epoch_pause_sec,
         torch_num_threads=cfg.torch_num_threads,
         cuda_memory_fraction=cfg.cuda_memory_fraction,
@@ -398,7 +533,7 @@ def save_prediction_sample(
     y_pred: np.ndarray,
     max_rows: int,
 ) -> None:
-    n = min(max_rows, len(y_true))
+    n = len(y_true) if max_rows <= 0 else min(max_rows, len(y_true))
     data = {"target_time": [str(t) for t in target_times[:n]]}
     for idx, col in enumerate(temp_cols):
         data[f"true_{col}"] = y_true[:n, idx]
@@ -492,15 +627,26 @@ def run_cross_site(cfg: CrossSiteConfig) -> Path:
                     f"model={model_name} train={len(train_refs)} val={len(val_refs)} test={len(test_refs)}"
                 )
                 start = time.time()
-                y_true, y_pred, target_times, best_val = train_factorized_cross_site(
-                    model_name,
-                    site_arrays,
-                    train_refs,
-                    val_refs,
-                    test_refs,
-                    cfg,
-                    device,
-                )
+                if model_name.lower() in TABULAR_MODELS:
+                    y_true, y_pred, target_times, best_val = train_factorized_cross_site_tabular(
+                        model_name,
+                        site_arrays,
+                        train_refs,
+                        val_refs,
+                        test_refs,
+                        cfg,
+                        seed,
+                    )
+                else:
+                    y_true, y_pred, target_times, best_val = train_factorized_cross_site(
+                        model_name,
+                        site_arrays,
+                        train_refs,
+                        val_refs,
+                        test_refs,
+                        cfg,
+                        device,
+                    )
                 metrics = base.field_metrics(y_true, y_pred)
                 rec: Dict[str, object] = {
                     "target_layout": cfg.target_layout,
@@ -513,6 +659,11 @@ def run_cross_site(cfg: CrossSiteConfig) -> Path:
                     "lookback_min": cfg.lookback_minutes,
                     "n_targets": len(temp_cols),
                     "n_features": len(feature_cols),
+                    "loss": cfg.loss,
+                    "spatial_loss_weight": cfg.spatial_loss_weight,
+                    "target_outlier_threshold": cfg.target_outlier_threshold,
+                    "scaler": cfg.scaler,
+                    "primary_metric": "Tmean_MAE",
                     "train_samples": len(train_refs),
                     "val_samples": len(val_refs),
                     "test_samples": len(test_refs),
@@ -533,8 +684,8 @@ def run_cross_site(cfg: CrossSiteConfig) -> Path:
                     cfg.prediction_sample_rows,
                 )
                 print(
-                    f"field_MAE={metrics['field_MAE']:.3f} "
                     f"Tmean_MAE={metrics['Tmean_MAE']:.3f} "
+                    f"field_MAE={metrics['field_MAE']:.3f} "
                     f"Tstd_MAE={metrics['Tstd_MAE']:.3f} "
                     f"Spread95_MAE={metrics['Spread95_MAE']:.3f}"
                 )
@@ -549,7 +700,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--resample-minutes", type=int, default=1)
     parser.add_argument("--lookback-minutes", type=int, default=60)
     parser.add_argument("--horizon-minutes", type=int, default=1)
-    parser.add_argument("--models", default="dlinear,autoformer_lite,crossformer_lite")
+    parser.add_argument(
+        "--models",
+        default="dlinear,ridge,random_forest,xgboost,mlp,autoformer_lite,crossformer_lite,timexer_lite",
+    )
     parser.add_argument("--seeds", default="42")
     parser.add_argument("--epochs", type=int, default=25)
     parser.add_argument("--patience", type=int, default=5)
@@ -562,7 +716,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--n-heads", type=int, default=4)
     parser.add_argument("--dropout", type=float, default=0.10)
     parser.add_argument("--loss", default="mse", choices=["mse", "smoothl1", "huber", "mae"])
-    parser.add_argument("--spatial-loss-weight", type=float, default=0.0)
+    parser.add_argument("--spatial-loss-weight", type=float, default=0.10)
+    parser.add_argument("--finite-prediction-clip", type=float, default=8.0)
     parser.add_argument("--epoch-pause-sec", type=float, default=0.0)
     parser.add_argument("--torch-num-threads", type=int, default=0)
     parser.add_argument("--cuda-memory-fraction", type=float, default=0.0)
@@ -573,7 +728,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-train-samples-per-site", type=int, default=60000)
     parser.add_argument("--max-val-samples-per-site", type=int, default=12000)
     parser.add_argument("--max-test-samples", type=int, default=60000)
-    parser.add_argument("--prediction-sample-rows", type=int, default=5000)
+    parser.add_argument("--prediction-sample-rows", type=int, default=0)
+    parser.add_argument("--target-outlier-threshold", type=float, default=25.0)
+    parser.add_argument("--scaler", default="robust", choices=["robust", "standard"])
     return parser
 
 
@@ -600,6 +757,7 @@ def main() -> None:
         dropout=args.dropout,
         loss=args.loss,
         spatial_loss_weight=args.spatial_loss_weight,
+        finite_prediction_clip=args.finite_prediction_clip,
         epoch_pause_sec=args.epoch_pause_sec,
         torch_num_threads=args.torch_num_threads,
         cuda_memory_fraction=args.cuda_memory_fraction,
@@ -611,6 +769,8 @@ def main() -> None:
         max_val_samples_per_site=args.max_val_samples_per_site,
         max_test_samples=args.max_test_samples,
         prediction_sample_rows=args.prediction_sample_rows,
+        target_outlier_threshold=args.target_outlier_threshold,
+        scaler=args.scaler,
     )
     run_dir = run_cross_site(cfg)
     print(f"\nCompleted. Metrics: {run_dir / 'metrics_cross_site.csv'}")
