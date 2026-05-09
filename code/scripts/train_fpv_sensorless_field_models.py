@@ -174,6 +174,7 @@ class Config:
     dropout: float = 0.10
     loss: str = "mse"
     spatial_loss_weight: float = 0.0
+    finite_prediction_clip: float = 8.0
     epoch_pause_sec: float = 0.0
     torch_num_threads: int = 0
     cuda_memory_fraction: float = 0.0
@@ -183,6 +184,8 @@ class Config:
     short_gap_limit_steps: int = 2
     temp_min: float = -30.0
     temp_max: float = 100.0
+    target_outlier_threshold: float = 0.0
+    prediction_sample_rows: int = 0
     missing_feature_threshold: float = 0.30
     max_rows: int = 0
     smoke: bool = False
