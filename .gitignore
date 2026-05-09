@@ -1,0 +1,35 @@
+# Large local datasets and downloaded source data
+data/
+
+# Local literature PDFs and copyrighted reference materials
+相关文献/
+
+# Training outputs, predictions, figures generated during exploration
+code/runs/
+code/figures/
+
+# Template documentation PDFs are reproducible/reference files; keep TeX/BST sources tracked.
+elsarticle/doc/*.pdf
+
+# Python caches and virtual environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# Jupyter and notebook checkpoints
+.ipynb_checkpoints/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+
+# Unrelated local project accidentally colocated in this workspace
+exo_sci_dl_project/

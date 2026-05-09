@@ -1,0 +1,72 @@
+{
+  "task": "sensorless_fpv_temperature_field_forecasting",
+  "formal_strategy": "factorized",
+  "description": "Two independent models reconstruct the 15-point module-temperature field: one predicts Tmean and one predicts spatial residuals.",
+  "input": {
+    "uses_module_temperature_history": false,
+    "lookback_minutes": 60,
+    "feature_sets": [
+      "meteorological",
+      "time_periodic",
+      "dynamic_differences",
+      "available_operating_features_if_not_high_missing"
+    ],
+    "feature_modes": [
+      "xgb_topk",
+      "raw"
+    ]
+  },
+  "output": {
+    "main_output": "15-point future module-temperature field",
+    "reconstruction": "T_field = Tmean + residual_field",
+    "primary_derived_metrics": [
+      "Tmean",
+      "Tstd",
+      "P95-P5 spread",
+      "MaxDev"
+    ],
+    "secondary_diagnostics": [
+      "Range/DeltaT"
+    ]
+  },
+  "formal_models": [
+    "crossformer_lite",
+    "autoformer_lite",
+    "timexer_lite",
+    "itransformer",
+    "dlinear"
+  ],
+  "ablation_models": [
+    "pathformer_lite",
+    "mscnn_lstm_attn",
+    "patch_transformer",
+    "lstm_attn",
+    "mlp"
+  ],
+  "horizons_minutes": [
+    1,
+    5,
+    10,
+    30
+  ],
+  "seeds": [
+    42,
+    3407,
+    2026
+  ],
+  "sites": {
+    "current": [
+      "oakville",
+      "orlando",
+      "windsor"
+    ],
+    "add_when_available": [
+      "altamonte"
+    ]
+  },
+  "notes": [
+    "Direct full-field prediction is retained only as an ablation.",
+    "Do not train direct DeltaT as a formal task.",
+    "Use Range/DeltaT only as a secondary diagnostic because it is sensitive to extremes."
+  ]
+}
