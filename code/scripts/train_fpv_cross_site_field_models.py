@@ -96,7 +96,8 @@ class CrossSiteConfig:
     n_heads: int = 4
     dropout: float = 0.10
     loss: str = "mse"
-    spatial_loss_weight: float = 0.0
+    spatial_loss_weight: float = 0.10
+    finite_prediction_clip: float = 8.0
     epoch_pause_sec: float = 0.0
     torch_num_threads: int = 0
     cuda_memory_fraction: float = 0.0
@@ -107,7 +108,9 @@ class CrossSiteConfig:
     max_train_samples_per_site: int = 60000
     max_val_samples_per_site: int = 12000
     max_test_samples: int = 60000
-    prediction_sample_rows: int = 5000
+    prediction_sample_rows: int = 0
+    target_outlier_threshold: float = 25.0
+    scaler: str = "robust"
 
     @property
     def lookback_steps(self) -> int:

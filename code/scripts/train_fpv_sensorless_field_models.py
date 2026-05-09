@@ -223,6 +223,32 @@ class ArrayScaler:
         return (x * self.std_ + self.mean_).astype(np.float32)
 
 
+class RobustArrayScaler:
+    def __init__(self) -> None:
+        self.center_: Optional[np.ndarray] = None
+        self.scale_: Optional[np.ndarray] = None
+
+    def fit(self, x: np.ndarray) -> "RobustArrayScaler":
+        self.center_ = np.nanmedian(x, axis=0).astype(np.float32)
+        q75 = np.nanpercentile(x, 75, axis=0).astype(np.float32)
+        q25 = np.nanpercentile(x, 25, axis=0).astype(np.float32)
+        self.scale_ = (q75 - q25).astype(np.float32)
+        self.scale_[self.scale_ < 1e-6] = 1.0
+        self.center_[~np.isfinite(self.center_)] = 0.0
+        self.scale_[~np.isfinite(self.scale_)] = 1.0
+        return self
+
+    def transform(self, x: np.ndarray) -> np.ndarray:
+        if self.center_ is None or self.scale_ is None:
+            raise RuntimeError("RobustArrayScaler is not fitted")
+        return ((x - self.center_) / self.scale_).astype(np.float32)
+
+    def inverse_transform(self, x: np.ndarray) -> np.ndarray:
+        if self.center_ is None or self.scale_ is None:
+            raise RuntimeError("RobustArrayScaler is not fitted")
+        return (x * self.scale_ + self.center_).astype(np.float32)
+
+
 class MinMaxFiller:
     def __init__(self) -> None:
         self.min_: Optional[np.ndarray] = None
@@ -457,6 +483,24 @@ def build_anchors(
 
     anchors = anchor_idx[in_range & window_valid & target_valid & irr_valid]
     return anchors.astype(np.int64)
+
+
+def remove_field_outlier_rows(
+    y_values: np.ndarray,
+    threshold: float,
+) -> Tuple[np.ndarray, int]:
+    if threshold <= 0:
+        return y_values, 0
+    y_clean = y_values.copy()
+    finite_rows = np.isfinite(y_clean).all(axis=1)
+    if not finite_rows.any():
+        return y_clean, 0
+    med = np.nanmedian(y_clean[finite_rows], axis=1, keepdims=True)
+    max_dev = np.nanmax(np.abs(y_clean[finite_rows] - med), axis=1)
+    bad_local = max_dev > threshold
+    bad_idx = np.flatnonzero(finite_rows)[bad_local]
+    y_clean[bad_idx, :] = np.nan
+    return y_clean, int(len(bad_idx))
 
 
 def chronological_split(
@@ -792,6 +836,7 @@ class CrossformerLite(nn.Module):
         self.stride = min(stride, self.segment_len)
         self.n_segments = 1 + max(0, (lookback - self.segment_len) // self.stride)
         self.value_proj = nn.Linear(self.segment_len, d_model)
+        self.value_norm = nn.LayerNorm(d_model)
         self.var_embed = nn.Parameter(torch.zeros(1, input_dim, 1, d_model))
         self.seg_embed = nn.Parameter(torch.zeros(1, 1, self.n_segments, d_model))
         nn.init.normal_(self.var_embed, std=0.02)
@@ -803,6 +848,7 @@ class CrossformerLite(nn.Module):
             dropout=dropout,
             batch_first=True,
             activation="gelu",
+            norm_first=True,
         )
         self.encoder = nn.TransformerEncoder(layer, num_layers=layers)
         self.head = nn.Sequential(nn.LayerNorm(d_model), nn.Linear(d_model, output_dim))
@@ -810,7 +856,7 @@ class CrossformerLite(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # B, T, C -> B, C, n_segments, segment_len
         z = x.transpose(1, 2).unfold(dimension=2, size=self.segment_len, step=self.stride)
-        z = self.value_proj(z)
+        z = self.value_norm(self.value_proj(z))
         z = z + self.var_embed[:, :, : z.size(2), :] + self.seg_embed[:, :, : z.size(2), :]
         z = z.flatten(start_dim=1, end_dim=2)
         z = self.encoder(z)
@@ -1229,6 +1275,21 @@ class CompositeRegressionLoss(nn.Module):
         return loss + self.spatial_weight * spatial
 
 
+def sanitize_prediction(pred: torch.Tensor, clip: float = 0.0) -> torch.Tensor:
+    if clip and clip > 0:
+        pred = torch.clamp(pred, -clip, clip)
+    return torch.nan_to_num(pred, nan=0.0, posinf=clip if clip and clip > 0 else 1e4, neginf=-(clip if clip and clip > 0 else 1e4))
+
+
+def sanitize_model_parameters(model: nn.Module, clip: float = 100.0) -> None:
+    with torch.no_grad():
+        for param in model.parameters():
+            if not torch.isfinite(param).all():
+                param.data = torch.nan_to_num(param.data, nan=0.0, posinf=clip, neginf=-clip)
+            if clip and clip > 0:
+                param.data.clamp_(-clip, clip)
+
+
 def train_one_model(
     model: nn.Module,
     train_loader: DataLoader,
@@ -1249,10 +1310,14 @@ def train_one_model(
             xb = xb.to(device)
             yb = yb.to(device)
             optim.zero_grad(set_to_none=True)
-            loss = criterion(model(xb), yb)
+            pred = sanitize_prediction(model(xb), cfg.finite_prediction_clip)
+            loss = criterion(pred, yb)
+            if not torch.isfinite(loss):
+                continue
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             optim.step()
+            sanitize_model_parameters(model)
 
         val_loss = evaluate_loss(model, val_loader, criterion, device)
         if val_loss < best_val:
@@ -1278,7 +1343,10 @@ def evaluate_loss(model: nn.Module, loader: DataLoader, criterion: nn.Module, de
     for xb, yb in loader:
         xb = xb.to(device)
         yb = yb.to(device)
-        losses.append(float(criterion(model(xb), yb).detach().cpu()))
+        pred = sanitize_prediction(model(xb))
+        loss = criterion(pred, yb).detach().cpu()
+        if torch.isfinite(loss):
+            losses.append(float(loss))
     return float(np.mean(losses)) if losses else float("inf")
 
 
@@ -1287,7 +1355,7 @@ def predict_model(model: nn.Module, loader: DataLoader, device: torch.device) ->
     model.eval()
     parts: List[np.ndarray] = []
     for xb, _ in loader:
-        pred = model(xb.to(device)).detach().cpu().numpy()
+        pred = sanitize_prediction(model(xb.to(device))).detach().cpu().numpy()
         parts.append(pred)
     return np.vstack(parts) if parts else np.empty((0, 0), dtype=np.float32)
 
@@ -1604,9 +1672,9 @@ def save_prediction_sample(
     temp_cols: Sequence[str],
     y_true: np.ndarray,
     y_pred: np.ndarray,
-    max_rows: int = 2000,
+    max_rows: int = 0,
 ) -> None:
-    n = min(max_rows, len(y_true))
+    n = len(y_true) if max_rows <= 0 else min(max_rows, len(y_true))
     data = {"target_time": [str(t) for t in target_times[:n]]}
     for idx, col in enumerate(temp_cols):
         data[f"true_{col}"] = y_true[:n, idx]
@@ -1643,6 +1711,10 @@ def run_experiments(cfg: Config) -> Path:
     df, temp_cols, feature_cols, irr_col = load_site_dataframe(cfg)
     x_raw = df[feature_cols].to_numpy(dtype=np.float32)
     y_temp = df[temp_cols].to_numpy(dtype=np.float32)
+    y_temp, removed_outlier_rows = remove_field_outlier_rows(
+        y_temp,
+        cfg.target_outlier_threshold,
+    )
 
     records: List[Dict[str, object]] = []
     config_payload = asdict(cfg)
@@ -1654,6 +1726,7 @@ def run_experiments(cfg: Config) -> Path:
             "temp_cols": temp_cols,
             "feature_cols": feature_cols,
             "irradiance_col": irr_col,
+            "removed_target_outlier_rows": removed_outlier_rows,
         }
     )
     (run_dir / "run_config.json").write_text(
@@ -1664,6 +1737,11 @@ def run_experiments(cfg: Config) -> Path:
     print(f"Device: {device}")
     print(f"Rows: {len(df)} | features: {len(feature_cols)} | temps: {len(temp_cols)}")
     print(f"Irradiance filter column: {irr_col or 'none'}")
+    if removed_outlier_rows:
+        print(
+            f"Removed target outlier rows before anchor building: "
+            f"{removed_outlier_rows} (threshold={cfg.target_outlier_threshold:g} degC)"
+        )
 
     for seed in cfg.seeds:
         set_seed(seed)
@@ -1751,6 +1829,8 @@ def run_experiments(cfg: Config) -> Path:
                             "n_temp_inputs": 0,
                             "loss": cfg.loss,
                             "spatial_loss_weight": cfg.spatial_loss_weight,
+                            "target_outlier_threshold": cfg.target_outlier_threshold,
+                            "primary_metric": "Tmean_MAE",
                             "train_samples": len(train_anchors),
                             "val_samples": len(val_anchors),
                             "test_samples": len(test_anchors),
@@ -1771,10 +1851,11 @@ def run_experiments(cfg: Config) -> Path:
                             temp_cols,
                             y_true,
                             y_pred,
+                            max_rows=cfg.prediction_sample_rows,
                         )
                         print(
-                            f"field_MAE={metrics['field_MAE']:.3f} "
                             f"Tmean_MAE={metrics['Tmean_MAE']:.3f} "
+                            f"field_MAE={metrics['field_MAE']:.3f} "
                             f"Tstd_MAE={metrics['Tstd_MAE']:.3f} "
                             f"Spread95_MAE={metrics['Spread95_MAE']:.3f}"
                         )
@@ -1826,6 +1907,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dropout", type=float, default=0.10)
     parser.add_argument("--loss", default="mse", choices=["mse", "smoothl1", "huber", "mae"])
     parser.add_argument("--spatial-loss-weight", type=float, default=0.0)
+    parser.add_argument("--finite-prediction-clip", type=float, default=8.0)
     parser.add_argument("--epoch-pause-sec", type=float, default=0.0)
     parser.add_argument("--torch-num-threads", type=int, default=0)
     parser.add_argument("--cuda-memory-fraction", type=float, default=0.0)
@@ -1833,6 +1915,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-irradiance", type=float, default=200.0)
     parser.add_argument("--input-min-mean-irradiance", type=float, default=100.0)
     parser.add_argument("--short-gap-limit-steps", type=int, default=2)
+    parser.add_argument("--target-outlier-threshold", type=float, default=0.0)
+    parser.add_argument("--prediction-sample-rows", type=int, default=0)
     parser.add_argument("--missing-feature-threshold", type=float, default=0.30)
     parser.add_argument("--max-rows", type=int, default=0)
     parser.add_argument("--smoke", action="store_true")
@@ -1870,6 +1954,7 @@ def main() -> None:
         dropout=args.dropout,
         loss=args.loss,
         spatial_loss_weight=args.spatial_loss_weight,
+        finite_prediction_clip=args.finite_prediction_clip,
         epoch_pause_sec=args.epoch_pause_sec,
         torch_num_threads=args.torch_num_threads,
         cuda_memory_fraction=args.cuda_memory_fraction,
@@ -1877,6 +1962,8 @@ def main() -> None:
         min_irradiance=args.min_irradiance,
         input_min_mean_irradiance=args.input_min_mean_irradiance,
         short_gap_limit_steps=args.short_gap_limit_steps,
+        target_outlier_threshold=args.target_outlier_threshold,
+        prediction_sample_rows=args.prediction_sample_rows,
         missing_feature_threshold=args.missing_feature_threshold,
         max_rows=args.max_rows,
         smoke=args.smoke,
